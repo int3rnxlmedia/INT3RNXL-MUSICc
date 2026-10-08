@@ -1,4 +1,6 @@
+import { spawn, type ChildProcess } from "node:child_process";
 import { Readable } from "node:stream";
+import { fileURLToPath } from "node:url";
 import {
   AudioPlayerStatus,
   createAudioPlayer,
@@ -29,6 +31,7 @@ import play from "play-dl";
 
 const logger = pino({ level: process.env["LOG_LEVEL"] ?? "info" });
 const botToken = process.env["DISCORD_BOT_TOKEN"];
+const workspaceRoot = fileURLToPath(new URL("../..", import.meta.url));
 const maxAttachmentBytes = 100 * 1024 * 1024;
 const maxQueueLength = 30;
 
@@ -54,12 +57,34 @@ interface GuildMusicState {
   queue: MusicTrack[];
   current: MusicTrack | null;
   resource: AudioResource<MusicTrack> | null;
+  extractor: ChildProcess | null;
   volume: number;
   active: boolean;
   starting: boolean;
 }
 
 const musicByGuild = new Map<string, GuildMusicState>();
+
+interface PreparedTrack {
+  resource: AudioResource<MusicTrack>;
+  extractor: ChildProcess | null;
+}
+
+function terminateExtractor(extractor: ChildProcess | null): void {
+  if (
+    extractor &&
+    extractor.exitCode === null &&
+    extractor.signalCode === null
+  ) {
+    extractor.kill("SIGTERM");
+  }
+}
+
+function stopExtractor(state: GuildMusicState): void {
+  const extractor = state.extractor;
+  state.extractor = null;
+  terminateExtractor(extractor);
+}
 
 const commandBuilders = [
   new SlashCommandBuilder()
@@ -116,12 +141,14 @@ function getMusicState(guildId: string): GuildMusicState {
     queue: [],
     current: null,
     resource: null,
+    extractor: null,
     volume: 0.7,
     active: true,
     starting: false,
   };
 
   state.player.on(AudioPlayerStatus.Idle, () => {
+    stopExtractor(state);
     if (!state.current || !state.active) return;
     state.current = null;
     state.resource = null;
@@ -129,6 +156,7 @@ function getMusicState(guildId: string): GuildMusicState {
   });
 
   state.player.on("error", (error) => {
+    stopExtractor(state);
     logger.error(
       { err: error, guildId, trackTitle: state.current?.title },
       "Audio playback failed",
@@ -433,22 +461,75 @@ async function notifyPlaybackFailure(track: MusicTrack): Promise<void> {
 
 async function createTrackResource(
   track: MusicTrack,
-): Promise<AudioResource<MusicTrack>> {
+): Promise<PreparedTrack> {
   if (track.kind === "youtube") {
-    const source = await play.stream(track.url, {
-      quality: 2,
-      discordPlayerCompatibility: true,
+    const extractor = spawn(
+      "uv",
+      [
+        "run",
+        "--project",
+        workspaceRoot,
+        "yt-dlp",
+        "--ignore-config",
+        "--js-runtimes",
+        "deno",
+        "--no-warnings",
+        "--no-progress",
+        "--quiet",
+        "--no-playlist",
+        "--format",
+        "bestaudio/best",
+        "--output",
+        "-",
+        "--",
+        track.url,
+      ],
+      {
+        cwd: workspaceRoot,
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+    const stream = extractor.stdout;
+    if (!stream) {
+      terminateExtractor(extractor);
+      throw new Error("Impossible de démarrer le lecteur YouTube.");
+    }
+    extractor.stderr?.resume();
+    extractor.once("error", (error) => {
+      logger.error({ err: error }, "Could not start yt-dlp");
+      if (!stream.destroyed) {
+        stream.destroy(new Error("Impossible de démarrer le lecteur YouTube."));
+      }
     });
-    return createAudioResource(source.stream, {
-      inputType: source.type as StreamType,
-      inlineVolume: true,
-      metadata: track,
+    extractor.once("close", (code) => {
+      if (code !== null && code !== 0 && !stream.destroyed) {
+        stream.destroy(new Error(`yt-dlp a échoué (code ${code}).`));
+      }
     });
+
+    try {
+      return {
+        resource: createAudioResource(stream, {
+          inputType: StreamType.Arbitrary,
+          inlineVolume: true,
+          metadata: track,
+        }),
+        extractor,
+      };
+    } catch (error) {
+      terminateExtractor(extractor);
+      throw error;
+    }
   }
 
-  const response = await fetch(track.url, {
-    signal: AbortSignal.timeout(20_000),
-  });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 20_000);
+  let response: Response;
+  try {
+    response = await fetch(track.url, { signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
   if (!response.ok || !response.body) {
     throw new Error("Impossible de télécharger le fichier audio joint.");
   }
@@ -456,11 +537,14 @@ async function createTrackResource(
   const stream = Readable.from(
     response.body as unknown as AsyncIterable<Uint8Array>,
   );
-  return createAudioResource(stream, {
-    inputType: StreamType.Arbitrary,
-    inlineVolume: true,
-    metadata: track,
-  });
+  return {
+    resource: createAudioResource(stream, {
+      inputType: StreamType.Arbitrary,
+      inlineVolume: true,
+      metadata: track,
+    }),
+    extractor: null,
+  };
 }
 
 async function playNext(state: GuildMusicState): Promise<void> {
@@ -471,22 +555,28 @@ async function playNext(state: GuildMusicState): Promise<void> {
   state.current = next;
   state.starting = true;
   let playbackFailed = false;
+  let extractor: ChildProcess | null = null;
 
   try {
-    const resource = await createTrackResource(next);
+    const prepared = await createTrackResource(next);
+    extractor = prepared.extractor;
     if (!state.active || state.current !== next) {
-      resource.playStream.destroy();
+      prepared.resource.playStream.destroy();
+      terminateExtractor(extractor);
       return;
     }
-    resource.volume?.setVolume(state.volume);
-    state.resource = resource;
-    state.player.play(resource);
+    state.extractor = extractor;
+    prepared.resource.volume?.setVolume(state.volume);
+    state.resource = prepared.resource;
+    state.player.play(prepared.resource);
     logger.info(
       { title: next.title, source: next.sourceLabel },
       "Started playback",
     );
   } catch (error) {
     playbackFailed = true;
+    terminateExtractor(extractor);
+    stopExtractor(state);
     logger.error(
       { err: error, title: next.title, source: next.sourceLabel },
       "Could not start track",
@@ -589,6 +679,7 @@ async function handleInteraction(
       case "stop":
         if (!state) throw new Error("Le bot ne joue rien pour le moment.");
         state.active = false;
+        stopExtractor(state);
         state.queue.length = 0;
         state.current = null;
         state.resource = null;

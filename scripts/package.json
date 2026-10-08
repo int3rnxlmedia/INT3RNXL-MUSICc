@@ -17,7 +17,6 @@
     "discord.js": "^14.27.0",
     "opusscript": "^0.0.8",
     "pino": "^9.14.0",
-    "play-dl": "^1.9.7",
-    "youtubei.js": "^18.1.0"
+    "play-dl": "^1.9.7"
   }
 }

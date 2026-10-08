@@ -1,1 +1,1 @@
-- [Discord audio dependencies](discord-audio-dependencies.md) — the native Opus package pulls a blocked tarball here; use the pure-JS encoder with FFmpeg.
+- [Discord audio dependencies](discord-audio-dependencies.md) — use opusscript + FFmpeg and current yt-dlp through uv with Deno for YouTube streams.
