@@ -13,8 +13,12 @@ import {
   type VoiceConnection,
 } from "@discordjs/voice";
 import {
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
   ChannelType,
   Client,
+  EmbedBuilder,
   Events,
   GatewayIntentBits,
   MessageFlags,
@@ -23,7 +27,9 @@ import {
   Routes,
   SlashCommandBuilder,
   type Attachment,
+  type ButtonInteraction,
   type Guild,
+  type Message,
   type ChatInputCommandInteraction,
 } from "discord.js";
 import pino from "pino";
@@ -43,6 +49,8 @@ if (!botToken) {
 
 interface MusicTrack {
   title: string;
+  artists: string[];
+  cover?: string;
   url: string;
   durationSeconds?: number;
   kind: "youtube" | "file";
@@ -61,9 +69,15 @@ interface GuildMusicState {
   volume: number;
   active: boolean;
   starting: boolean;
+  loop: boolean;
+  history: MusicTrack[];
+  pendingAction: "skip" | "previous" | null;
+  panelMessage: Message | null;
 }
 
 const musicByGuild = new Map<string, GuildMusicState>();
+const volumeStep = 10;
+const historyLimit = 20;
 
 interface PreparedTrack {
   resource: AudioResource<MusicTrack>;
@@ -145,13 +159,29 @@ function getMusicState(guildId: string): GuildMusicState {
     volume: 0.7,
     active: true,
     starting: false,
+    loop: false,
+    history: [],
+    pendingAction: null,
+    panelMessage: null,
   };
 
   state.player.on(AudioPlayerStatus.Idle, () => {
     stopExtractor(state);
     if (!state.current || !state.active) return;
+    const finished = state.current;
+    const action = state.pendingAction;
+    state.pendingAction = null;
     state.current = null;
     state.resource = null;
+
+    if (action === "skip") {
+      pushHistory(state, finished);
+    } else if (action === null) {
+      // Fin naturelle du titre : on le rejoue si la répétition est activée.
+      if (state.loop) state.queue.unshift(finished);
+      else pushHistory(state, finished);
+    }
+    // action === "previous" : la file a déjà été réorganisée par le bouton.
     void playNext(state);
   });
 
@@ -162,6 +192,7 @@ function getMusicState(guildId: string): GuildMusicState {
       "Audio playback failed",
     );
     if (state.current) void notifyPlaybackFailure(state.current);
+    state.pendingAction = null;
     state.current = null;
     state.resource = null;
     void playNext(state);
@@ -285,6 +316,8 @@ async function findYouTubeTrack(
 
   return {
     title: safeTitle(video.title, query),
+    artists: artistsFromChannel(video.channel?.name),
+    cover: youtubeCover(video.thumbnails, video.id),
     url: video.url,
     durationSeconds: video.durationInSec,
     kind: "youtube",
@@ -342,6 +375,7 @@ async function spotifyTrackToYouTube(
   const metadata = (await response.json()) as {
     title?: unknown;
     author_name?: unknown;
+    thumbnail_url?: unknown;
   };
   if (typeof metadata.title !== "string" || !metadata.title.trim()) {
     throw new Error("Spotify n’a pas fourni le titre de ce morceau.");
@@ -362,7 +396,13 @@ async function spotifyTrackToYouTube(
   );
   return {
     ...track,
-    title: (artist ? `${spotifyTitle} — ${artist}` : spotifyTitle).slice(0, 180),
+    title: spotifyTitle,
+    // oEmbed ne donne généralement pas l'artiste : repli sur la chaîne YouTube.
+    artists: artist ? [artist] : track.artists,
+    cover:
+      typeof metadata.thumbnail_url === "string"
+        ? metadata.thumbnail_url
+        : track.cover,
   };
 }
 
@@ -403,6 +443,8 @@ async function resolveTrack(
 
     return {
       title: safeTitle(details.title, "Vidéo YouTube"),
+      artists: artistsFromChannel(details.channel?.name),
+      cover: youtubeCover(details.thumbnails, videoId),
       url: videoUrl,
       durationSeconds: details.durationInSec,
       kind: "youtube",
@@ -439,6 +481,7 @@ function resolveAudioFile(
 
   return {
     title: safeTitle(attachment.name, "Fichier audio"),
+    artists: ["Fichier audio"],
     url: attachment.url,
     kind: "file",
     requester,
@@ -555,7 +598,10 @@ async function createTrackResource(
 async function playNext(state: GuildMusicState): Promise<void> {
   if (state.starting || state.current || !state.active) return;
   const next = state.queue.shift();
-  if (!next) return;
+  if (!next) {
+    void refreshPanel(state); // plus rien à jouer : le panneau passe en « terminé »
+    return;
+  }
 
   state.current = next;
   state.starting = true;
@@ -578,6 +624,7 @@ async function playNext(state: GuildMusicState): Promise<void> {
       { title: next.title, source: next.sourceLabel },
       "Started playback",
     );
+    void refreshPanel(state);
   } catch (error) {
     playbackFailed = true;
     terminateExtractor(extractor);
@@ -607,6 +654,225 @@ function formatDuration(seconds?: number): string {
     .toString()
     .padStart(2, "0");
   return `${minutes}:${remainingSeconds}`;
+}
+
+function pushHistory(state: GuildMusicState, track: MusicTrack): void {
+  state.history.push(track);
+  if (state.history.length > historyLimit) state.history.shift();
+}
+
+function isPaused(state: GuildMusicState): boolean {
+  const status = state.player.state.status;
+  return (
+    status === AudioPlayerStatus.Paused ||
+    status === AudioPlayerStatus.AutoPaused
+  );
+}
+
+function applyVolume(state: GuildMusicState, percent: number): void {
+  const clamped = Math.min(100, Math.max(0, Math.round(percent)));
+  state.volume = clamped / 100;
+  state.resource?.volume?.setVolume(state.volume);
+}
+
+/** Demande un changement de titre manuel ; renvoie false si rien ne joue. */
+function requestTrackChange(
+  state: GuildMusicState,
+  action: "skip" | "previous",
+): boolean {
+  state.pendingAction = action;
+  if (!state.player.stop(true)) {
+    state.pendingAction = null;
+    return false;
+  }
+  return true;
+}
+
+function artistsFromChannel(name: string | undefined): string[] {
+  const cleaned = safeTitle(name, "").replace(/\s*-\s*Topic$/i, "").trim();
+  return [cleaned || "Artiste inconnu"];
+}
+
+function youtubeCover(
+  thumbnails: { url: string }[] | undefined,
+  videoId: string | undefined,
+): string | undefined {
+  const best = thumbnails?.[thumbnails.length - 1]?.url;
+  if (best) return best;
+  return videoId
+    ? `https://i.ytimg.com/vi/${encodeURIComponent(videoId)}/hqdefault.jpg`
+    : undefined;
+}
+
+function buildPanel(state: GuildMusicState) {
+  const track = state.current;
+  if (!track) {
+    return {
+      embeds: [
+        new EmbedBuilder()
+          .setColor(0x747f8d)
+          .setTitle("Lecture terminée")
+          .setDescription("Utilise /play pour lancer un nouveau titre."),
+      ],
+      components: [] as ActionRowBuilder<ButtonBuilder>[],
+    };
+  }
+
+  const paused = isPaused(state);
+  const volumePercent = Math.round(state.volume * 100);
+  const upcoming = state.queue[0];
+
+  const embed = new EmbedBuilder()
+    .setColor(paused ? 0xfaa61a : 0x5865f2)
+    .setAuthor({ name: paused ? "En pause" : "En cours de lecture" })
+    .setTitle(track.title)
+    .setDescription(
+      `**${track.artists.length > 1 ? "Artistes" : "Artiste"} :** ${track.artists.join(", ")}`,
+    )
+    .addFields(
+      {
+        name: "Durée",
+        value: formatDuration(track.durationSeconds),
+        inline: true,
+      },
+      { name: "Demandé par", value: track.requester, inline: true },
+      { name: "Source", value: track.sourceLabel, inline: true },
+    )
+    .setFooter({
+      text: upcoming
+        ? `Suivant : ${upcoming.title}${state.queue.length > 1 ? ` (+${state.queue.length - 1})` : ""}`
+        : "Aucun titre en attente",
+    });
+  if (track.kind === "youtube") embed.setURL(track.url);
+  if (track.cover) embed.setThumbnail(track.cover);
+
+  const controls = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId("player:prev")
+      .setEmoji("⏮️")
+      .setLabel("Précédent")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(state.history.length === 0),
+    new ButtonBuilder()
+      .setCustomId("player:toggle")
+      .setEmoji(paused ? "▶️" : "⏸️")
+      .setLabel(paused ? "Lecture" : "Pause")
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId("player:next")
+      .setEmoji("⏭️")
+      .setLabel("Suivant")
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId("player:loop")
+      .setEmoji("🔁")
+      .setLabel(state.loop ? "Répétition : ON" : "Répétition : OFF")
+      .setStyle(state.loop ? ButtonStyle.Success : ButtonStyle.Secondary),
+  );
+
+  const volume = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId("player:vol_down")
+      .setEmoji("🔉")
+      .setLabel(`-${volumeStep}`)
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(volumePercent <= 0),
+    new ButtonBuilder()
+      .setCustomId("player:vol_display")
+      .setLabel(`Volume ${volumePercent} %`)
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(true),
+    new ButtonBuilder()
+      .setCustomId("player:vol_up")
+      .setEmoji("🔊")
+      .setLabel(`+${volumeStep}`)
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(volumePercent >= 100),
+  );
+
+  return { embeds: [embed], components: [controls, volume] };
+}
+
+async function refreshPanel(state: GuildMusicState): Promise<void> {
+  const message = state.panelMessage;
+  if (!message) return;
+  const payload = buildPanel(state);
+  if (!state.current) state.panelMessage = null; // panneau terminé
+  try {
+    await message.edit(payload);
+  } catch (error) {
+    logger.warn({ err: error }, "Could not update the player panel");
+    if (state.panelMessage === message) state.panelMessage = null;
+  }
+}
+
+async function handleButton(interaction: ButtonInteraction): Promise<void> {
+  if (!interaction.customId.startsWith("player:")) return;
+
+  const deny = (content: string) =>
+    interaction.reply({ content, flags: MessageFlags.Ephemeral });
+
+  const guild = interaction.guild;
+  const state = guild ? musicByGuild.get(guild.id) : undefined;
+  const current = state?.current;
+  if (!guild || !state || !current) {
+    await deny("Aucune lecture en cours.");
+    return;
+  }
+
+  const userChannelId = guild.voiceStates.cache.get(
+    interaction.user.id,
+  )?.channelId;
+  if (
+    !userChannelId ||
+    userChannelId !== state.connection?.joinConfig.channelId
+  ) {
+    await deny("Rejoins le salon vocal du bot pour utiliser ces boutons.");
+    return;
+  }
+
+  state.panelMessage = interaction.message;
+  const volumePercent = Math.round(state.volume * 100);
+
+  switch (interaction.customId) {
+    case "player:toggle":
+      if (isPaused(state)) state.player.unpause();
+      else state.player.pause();
+      break;
+    case "player:loop":
+      state.loop = !state.loop;
+      break;
+    case "player:vol_up":
+      applyVolume(state, volumePercent + volumeStep);
+      break;
+    case "player:vol_down":
+      applyVolume(state, volumePercent - volumeStep);
+      break;
+    case "player:next":
+      // Le panneau est mis à jour par playNext() quand le nouveau titre démarre.
+      await interaction.deferUpdate();
+      requestTrackChange(state, "skip");
+      return;
+    case "player:prev": {
+      const previous = state.history.pop();
+      if (!previous) {
+        await deny("Aucun titre précédent.");
+        return;
+      }
+      state.queue.unshift(previous, current);
+      await interaction.deferUpdate();
+      if (!requestTrackChange(state, "previous")) {
+        state.queue.splice(0, 2);
+        state.history.push(previous);
+      }
+      return;
+    }
+    default:
+      await interaction.deferUpdate();
+      return;
+  }
+
+  await interaction.update(buildPanel(state));
 }
 
 async function handlePlay(
@@ -639,11 +905,23 @@ async function handlePlay(
     throw new Error(`La file est limitée à ${maxQueueLength} titres.`);
   }
 
+  const wasIdle = !state.current && !state.starting;
   state.queue.push(track);
-  void playNext(state);
-  await interaction.editReply(
-    `Ajouté à la file : **${track.title}** (${track.sourceLabel}).`,
-  );
+  await playNext(state);
+
+  if (wasIdle && !state.current) {
+    throw new Error("Impossible de lire ce titre.");
+  }
+
+  if (wasIdle || !state.panelMessage) {
+    // Nouveau panneau de contrôle (premier titre, ou ancien panneau disparu).
+    state.panelMessage = await interaction.editReply(buildPanel(state));
+  } else {
+    await interaction.editReply(
+      `Ajouté à la file : **${track.title}** (${track.sourceLabel}).`,
+    );
+    await refreshPanel(state);
+  }
 }
 
 async function handleInteraction(
@@ -669,16 +947,18 @@ async function handleInteraction(
           throw new Error("Aucun titre n’est en cours de lecture.");
         }
         await interaction.reply("Lecture mise en pause.");
+        void refreshPanel(state);
         return;
       case "resume":
         if (!state?.current || !state.player.unpause()) {
           throw new Error("Aucun titre en pause à reprendre.");
         }
         await interaction.reply("Lecture reprise.");
+        void refreshPanel(state);
         return;
       case "skip":
         if (!state?.current) throw new Error("Aucun titre à passer.");
-        state.player.stop(true);
+        requestTrackChange(state, "skip");
         await interaction.reply("Titre passé.");
         return;
       case "stop":
@@ -690,6 +970,7 @@ async function handleInteraction(
         state.resource = null;
         state.player.stop(true);
         state.connection?.destroy();
+        await refreshPanel(state);
         musicByGuild.delete(interaction.guild.id);
         await interaction.reply("Lecture arrêtée, le bot a quitté le salon.");
         return;
@@ -721,9 +1002,9 @@ async function handleInteraction(
           );
           return;
         }
-        state.volume = requestedVolume / 100;
-        state.resource?.volume?.setVolume(state.volume);
+        applyVolume(state, requestedVolume);
         await interaction.reply(`Volume réglé à ${requestedVolume} %.`);
+        void refreshPanel(state);
         return;
       }
       default:
@@ -776,6 +1057,10 @@ client.on(Events.InteractionCreate, (interaction) => {
   if (interaction.isChatInputCommand()) {
     void handleInteraction(interaction).catch((error: unknown) => {
       logger.error({ err: error }, "Unhandled command error");
+    });
+  } else if (interaction.isButton()) {
+    void handleButton(interaction).catch((error: unknown) => {
+      logger.error({ err: error }, "Unhandled button error");
     });
   }
 });
