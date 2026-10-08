@@ -7,6 +7,8 @@ For Discord voice in this workspace, `@discordjs/opus` pulled `@discordjs/node-p
 
 For YouTube audio, `play-dl@1.9.7` can find videos but its stream extraction returned an undefined media URL. The Nix-provided yt-dlp was too old for current YouTube extraction. The current yt-dlp Python package needs to run inside the workspace's `uv` environment, with Deno available for JavaScript challenges.
 
-**Why:** The native Opus install was blocked by the package firewall, and the old YouTube stream extractor failed on active links.
+Spotify's official oEmbed response for tracks includes the title and provider name but no artist field. The title alone is suitable for YouTube search; `author_name` must not be required.
 
-**How to apply:** Use `opusscript` with system FFmpeg for Discord voice encoding. For YouTube, keep yt-dlp current, install its `default` extra, and invoke it through `uv run --project <workspace-root> yt-dlp` with Deno available; do not call the `.pythonlibs` launcher directly.
+**Why:** The native Opus install was blocked by the package firewall, the old YouTube stream extractor failed on active links, and requiring an `author_name` field made valid Spotify oEmbed responses fail.
+
+**How to apply:** Use `opusscript` with system FFmpeg for Discord voice encoding. For YouTube, keep yt-dlp current, install its `default` extra, and invoke it through `uv run --project <workspace-root> yt-dlp` with Deno available; do not call the `.pythonlibs` launcher directly. For Spotify tracks, search using the returned title and treat artist metadata as optional.

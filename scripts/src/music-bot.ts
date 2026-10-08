@@ -343,22 +343,27 @@ async function spotifyTrackToYouTube(
     title?: unknown;
     author_name?: unknown;
   };
-  if (
-    typeof metadata.title !== "string" ||
-    typeof metadata.author_name !== "string"
-  ) {
-    throw new Error("Les informations de ce morceau Spotify sont incomplètes.");
+  if (typeof metadata.title !== "string" || !metadata.title.trim()) {
+    throw new Error("Spotify n’a pas fourni le titre de ce morceau.");
   }
 
   const spotifyTitle = safeTitle(metadata.title, "Titre Spotify");
-  const artist = safeTitle(metadata.author_name, "");
+  const artist =
+    typeof metadata.author_name === "string" &&
+    metadata.author_name.trim() &&
+    metadata.author_name.trim().toLowerCase() !== "spotify"
+      ? safeTitle(metadata.author_name, "")
+      : "";
   const track = await findYouTubeTrack(
-    `${spotifyTitle} ${artist}`,
+    artist ? `${spotifyTitle} ${artist}` : spotifyTitle,
     requester,
     channelId,
     "Spotify → YouTube",
   );
-  return { ...track, title: `${spotifyTitle} — ${artist}`.slice(0, 180) };
+  return {
+    ...track,
+    title: (artist ? `${spotifyTitle} — ${artist}` : spotifyTitle).slice(0, 180),
+  };
 }
 
 async function resolveTrack(

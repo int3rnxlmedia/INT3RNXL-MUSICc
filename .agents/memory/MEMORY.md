@@ -1,1 +1,1 @@
-- [Discord audio dependencies](discord-audio-dependencies.md) — use opusscript + FFmpeg and current yt-dlp through uv with Deno for YouTube streams.
+- [Discord audio dependencies](discord-audio-dependencies.md) — Spotify oEmbed is title-only; use current yt-dlp for streams and opusscript + FFmpeg for voice.

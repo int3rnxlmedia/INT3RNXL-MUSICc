@@ -31,7 +31,7 @@ Bot Discord avec commandes slash pour lire des liens YouTube, retrouver sur YouT
 
 ## Architecture decisions
 
-- Spotify links provide track metadata only; playback resolves the title and artist to a YouTube video.
+- Spotify oEmbed provides the track title but not its artist; playback searches YouTube using that title.
 - YouTube audio is streamed by yt-dlp into FFmpeg; keep yt-dlp current because YouTube changes its stream formats.
 - Slash commands are registered globally when the bot starts.
 
