@@ -1,4 +1,4 @@
-modules = ["nodejs-24"]
+modules = ["nodejs-24", "python-base-3.13"]
 
 [deployment]
 router = "application"
@@ -41,4 +41,4 @@ timeoutMs = 20000
 
 [nix]
 channel = "stable-25_05"
-packages = ["ffmpeg"]
+packages = ["deno", "ffmpeg", "yt-dlp"]
