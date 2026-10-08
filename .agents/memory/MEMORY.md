@@ -1,0 +1,1 @@
+- [Discord audio dependencies](discord-audio-dependencies.md) — the native Opus package pulls a blocked tarball here; use the pure-JS encoder with FFmpeg.

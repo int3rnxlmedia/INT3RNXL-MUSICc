@@ -1,20 +1,23 @@
-# [Project name]
+# Bot musical Discord
 
-_Replace the heading above with the project's name, and this line with one sentence describing what this app does for users._
+Bot Discord avec commandes slash pour lire des liens YouTube, retrouver sur YouTube un titre partagé depuis Spotify, ou lire un fichier audio joint.
 
 ## Run & Operate
 
 - `pnpm --filter @workspace/api-server run dev` — run the API server (port 5000)
+- `pnpm --filter @workspace/scripts run music-bot` — run the Discord music bot
 - `pnpm run typecheck` — full typecheck across all packages
 - `pnpm run build` — typecheck + build all packages
 - `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
 - `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
-- Required env: `DATABASE_URL` — Postgres connection string
+- Required secret: `DISCORD_BOT_TOKEN`
+- FFmpeg is required for decoding attached audio files.
 
 ## Stack
 
 - pnpm workspaces, Node.js 24, TypeScript 5.9
 - API: Express 5
+- Discord bot: discord.js, @discordjs/voice, play-dl
 - DB: PostgreSQL + Drizzle ORM
 - Validation: Zod (`zod/v4`), `drizzle-zod`
 - API codegen: Orval (from OpenAPI spec)
@@ -22,23 +25,28 @@ _Replace the heading above with the project's name, and this line with one sente
 
 ## Where things live
 
-_Populate as you build — short repo map plus pointers to the source-of-truth file for DB schema, API contracts, theme files, etc._
+- `scripts/src/music-bot.ts` — Discord bot, slash commands, queue and streaming
+- The API server remains a separate shared service.
 
 ## Architecture decisions
 
-_Populate as you build — non-obvious choices a reader couldn't infer from the code (3-5 bullets)._
+- Spotify links provide track metadata only; playback resolves the title and artist to a YouTube video.
+- Slash commands are registered globally when the bot starts.
 
 ## Product
 
-_Describe the high-level user-facing capabilities of this app once they exist._
+- `/play` accepts a YouTube URL, an individual Spotify track URL, a search query, or one audio attachment.
+- `/pause`, `/resume`, `/skip`, `/stop`, `/queue`, and `/volume` control playback.
+- The bot operates in one voice channel per Discord server and keeps an in-memory queue.
 
 ## User preferences
 
-_Populate as you build — explicit user instructions worth remembering across sessions._
+- User requested a music bot that accepts Spotify and YouTube links or an audio file.
 
 ## Gotchas
 
-_Populate as you build — sharp edges, "always run X before Y" rules._
+- Spotify does not stream audio to the bot; the bot searches YouTube for the linked track.
+- The bot must be invited to a server with voice and slash-command permissions.
 
 ## Pointers
 

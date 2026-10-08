@@ -5,10 +5,18 @@
   "type": "module",
   "scripts": {
     "hello": "tsx ./src/hello.ts",
+    "music-bot": "tsx ./src/music-bot.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "devDependencies": {
     "@types/node": "catalog:",
     "tsx": "catalog:"
+  },
+  "dependencies": {
+    "@discordjs/voice": "^0.19.2",
+    "discord.js": "^14.27.0",
+    "opusscript": "^0.0.8",
+    "pino": "^9.14.0",
+    "play-dl": "^1.9.7"
   }
 }
